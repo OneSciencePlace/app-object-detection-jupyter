@@ -13,12 +13,15 @@ run.py --image photo.jpg  ─────▶  object_detection_tutorial.ipynb
               └────── yolo11n.pt, <stem>_detected.jpg, detections.json ──────┘
 ```
 
-It is built on `app-jupyter`: **branch A** of the interactive contract, so
-JupyterLab binds the single exposed port directly with its native `?token=`
-auth and there is no nginx gate.
+It is built on `app-jupyter`: JupyterLab behind the token gate, like every
+interactive app. The gate is the session's one TCP listener and checks its
+token; JupyterLab listens on a Unix socket in the session's private directory.
 
 ```
-browser ──https──▶ Satellite ──http──▶ 0.0.0.0:OSP_APP_PORT   jupyter lab
+browser ──https──▶ Satellite proxy ──ssh tunnel──▶ $OSP_APP_BIND:$OSP_APP_PORT   nginx gate
+                                                    (127.0.0.1 by default)       │ cookie / 403
+                                                                                 ▼
+                                                  $OSP_APP_SOCK_DIR/app.sock     jupyter lab
 ```
 
 ## Contents
@@ -29,36 +32,55 @@ browser ──https──▶ Satellite ──http──▶ 0.0.0.0:OSP_APP_PORT 
 | `requirements.txt` | Pinned Python deps — `app-jupyter`'s plus `app-object-detection`'s. |
 | `notebooks/object_detection_tutorial.ipynb` | The tutorial. Read-only master copy, baked in at `/app/notebooks/`. |
 | `entrypoint.sh` | The image ENTRYPOINT. Seeds the notebook, then `exec`s `jupyter lab` with `"$@"`. |
-| `web/session-env.sh` | The interactive session contract. Copied verbatim from `app-jupyter`. |
+| (`/app/web/`) | The session contract, the token gate and the supervisor. Not in this repo: the `Dockerfile` copies them from the template's kit image, `app-kit`. |
 | `.github/workflows/build-and-push.yml` | Build + push both artifacts. App-agnostic — copy as-is. |
 
 ## Run it
 
-```bash
-TOKEN=$(openssl rand -hex 32)
+The token is never put on a command line: `ps` shows command lines to every
+user on a node. Pass it through the environment.
 
+```bash
+export OSP_APP_TOKEN=$(openssl rand -hex 32)
+
+# Docker (local). -e OSP_APP_TOKEN with no "=value" copies it from your
+# environment. OSP_APP_BIND=0.0.0.0 because `-p` cannot reach a container's
+# loopback; the host side is still published on 127.0.0.1 only.
 docker run --rm --user "$(id -u):$(id -g)" \
-  -p 8888:8888 -v "$PWD:/home/ospuser" \
-  -e OSP_APP_PORT=8888 -e OSP_APP_TOKEN="$TOKEN" \
+  -p 127.0.0.1:8888:8888 -v "$PWD:/home/ospuser" \
+  -e OSP_APP_PORT=8888 -e OSP_APP_BIND=0.0.0.0 -e OSP_APP_TOKEN \
   ghcr.io/onescienceplace/app-object-detection-jupyter:latest
 
-apptainer pull oras://ghcr.io/onescienceplace/app-object-detection-jupyter-sif:latest
-apptainer run --env OSP_APP_PORT=8888 --env OSP_APP_TOKEN="$TOKEN" \
+# Apptainer, under the OSP interactive run profile.
+# APPTAINERENV_<NAME> reaches the container as <NAME>, even with --cleanenv
+# (SingularityCE: SINGULARITYENV_<NAME>).
+apptainer pull oras://ghcr.io/onescienceplace/app-object-detection-jupyter-sif:latest   # production pins <version>@sha256:<digest>
+mkdir -p tmp
+export APPTAINERENV_OSP_APP_TOKEN="$OSP_APP_TOKEN"
+apptainer run \
+  --contain --pid --ipc --cleanenv --no-mount bind-paths,cwd \
+  --pwd "$PWD" --bind "$PWD:$PWD" \
+  --env OSP_APP_PORT=8888 --env TMPDIR="$PWD/tmp" \
   app-object-detection-jupyter-sif_latest.sif
 ```
 
-Then open `https://<session>.<satellite-domain>/?token=$TOKEN`. JupyterLab opens
-on the tutorial notebook directly.
+Then open `http://127.0.0.1:8888/?token=<the token>` (add an
+`ssh -L 8888:127.0.0.1:8888 <host>` forward first if it runs elsewhere).
+Through the portal the link is
+`https://<session-label>.<sat-id>.sat.<domain>/?token=<token>`, handed out by
+the launcher once the gate's `/healthz` answers. JupyterLab opens on the
+tutorial notebook directly.
 
-The container prints its port and entry path on startup, which is what the job
-script needs to register the mapping with Satellite. Put a JPEG in the directory
-you mounted (or upload one from inside the notebook) and run the cells.
+The container prints its port on startup, and the entry path without the
+token when the launcher supplied it. Put a JPEG in the working directory (or upload
+one from inside the notebook) and run the cells.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OSP_APP_PORT` | `8888` | the single port served |
-| `OSP_APP_TOKEN` | generated | per-session secret; JupyterLab's own `?token=` |
-| `OSP_APP_TOKEN_NAME` | `token` | fixed here — it is Jupyter's own parameter name |
+| `OSP_APP_PORT` | `8888` | the one TCP port, served by the gate |
+| `OSP_APP_BIND` | `127.0.0.1` | the address it binds; `0.0.0.0` only inside a Docker job's own network, or for local `docker run -p` |
+| `OSP_APP_TOKEN` | generated | per-session secret, checked by the gate |
+| `OSP_APP_TOKEN_NAME` | `token` | the query parameter (and cookie) it arrives in |
 | `APP_MODEL` | `/app/yolo11n.pt` | the baked-in weights; same variable `run.py` reads |
 | `OSP_NOTEBOOK` | `object_detection_tutorial.ipynb` | the notebook JupyterLab opens on |
 | `OSP_SEED_NOTEBOOKS` | `1` | set `0` to skip seeding entirely |
@@ -71,7 +93,9 @@ directory with a real `/etc/passwd` entry — `whoami` works, `ls -l` shows name
 and nothing runs as root.
 
 Under Apptainer none of that applies: the container is always the invoking user
-and the image's `WORKDIR` is ignored in favour of the directory you ran from.
+and the image's `WORKDIR` is ignored in favor of the directory you ran from (the job
+directory, under the run profile, where `$HOME` is also a private, empty
+directory for the session).
 Both cases end up in the same place conceptually — **the session's working
 directory** — which is also where `run.py` reads and writes. That symmetry is
 the point: a path that works in the notebook works in the batch app.
@@ -95,7 +119,7 @@ If the working directory is not writable it says so on stderr and leaves the
 read-only master where you can still open it.
 
 Anything you write lands next to the notebook. Under Docker that survives the
-container only if you bind-mounted the directory; under Apptainer it is your own
+container only if you bind-mounted the directory; under Apptainer it is the job
 directory already.
 
 ## Consistency with the batch app
@@ -121,36 +145,37 @@ What the notebook adds is the part a one-shot entrypoint cannot show: a slider
 that reruns `model.predict` at a new threshold, so you see the effect of
 `--conf` rather than reasoning about it.
 
-## Kernels and scratch paths
+## Kernels, the session directory and scratch paths
 
-Inherited unchanged from `app-jupyter`, and the reasoning there applies verbatim:
+Inherited unchanged from `app-jupyter`, whose README has the reasoning:
 
-The token is passed as `JUPYTER_TOKEN` in the environment, never as a command
-line argument — `/proc/<pid>/cmdline` is world-readable, so `ps aux` on a shared
-node would otherwise hand the session to anyone there.
+- JupyterLab sits behind the gate on a Unix socket, with its own token off and
+  without `OSP_APP_TOKEN` in its environment: only the gate holds the
+  session's secret. **File > Shut Down** ends the session with status 0.
+- Kernels run over **Unix sockets, not TCP** (`--KernelManager.transport=ipc`).
+- `JUPYTER_CONFIG_DIR`, `JUPYTER_DATA_DIR`, `JUPYTER_RUNTIME_DIR` and
+  `IPYTHONDIR` live in the session's private directory,
+  `$OSP_APP_SOCK_DIR/jupyter/…`: the runtime directory holds the kernel
+  connection files and sockets. The notebook-signing key is therefore
+  regenerated every session, so notebook *trust* does not persist.
+- **No debugger**: the image removes `debugpy`, whose debug server would keep
+  listening on the node's loopback, unauthenticated, after the debugger is
+  turned off.
+- One loopback listener remains, each kernel's pipe for output from forked
+  subprocesses; it acts only on messages carrying a random per-kernel key.
+- `--ServerApp.trust_xheaders` and `--ServerApp.allow_remote_access` make it
+  work behind the Satellite proxy.
 
-Kernels run over **unix sockets, not TCP** (`--KernelManager.transport=ipc`).
-Apptainer has no network namespace, so TCP kernel ports would land on the
-compute node's real loopback, visible to every other user with a shell there.
+The library caches (`XDG_CACHE_HOME`, `YOLO_CONFIG_DIR`, `MPLCONFIGDIR`)
+default to `/tmp` in the image, for the same read-only-filesystem reason as the
+batch app; at run time each moves to a per-session directory under `$TMPDIR`
+(`<job directory>/tmp` under the run profile), unless the job set its own.
 
-`JUPYTER_CONFIG_DIR`, `JUPYTER_DATA_DIR`, `JUPYTER_RUNTIME_DIR` and `IPYTHONDIR`
-are derived at startup from `$TMPDIR` and the runtime uid
-(`$TMPDIR/jupyter-$(id -u)/…`), because Jupyter creates them `0700` and `/tmp`
-is shared with every other user on the node. One consequence: the
-notebook-signing key is regenerated every session, so notebook *trust* does not
-persist and saved HTML/JS output needs a re-run to render.
-
-The library caches go to `/tmp` for the same read-only-filesystem reason as the
-batch app: `XDG_CACHE_HOME`, `YOLO_CONFIG_DIR`, `MPLCONFIGDIR`.
-
-**Scratch paths.** The entrypoint does not trust `$TMPDIR`. A scheduler's
-`/scratch/$USER/job.N` is a host path Apptainer does not bind by default, so it
+**Scratch paths.** The entrypoint does not trust an inherited `$TMPDIR`. A
+scheduler's `/scratch/$USER/job.N` is a host path Apptainer may not bind, so it
 probes `$TMPDIR`, `/tmp`, `$HOME` in turn and reports on stderr which it took.
-Pass `--bind /scratch` if you want the real one used.
-
-`--ServerApp.trust_xheaders` is the one thing that matters for running behind
-Satellite: TLS is terminated upstream, and without it Jupyter builds `ws://`
-websocket URLs on an `https://` page and the browser refuses them.
+Do not bind a scratch parent (`--bind /scratch`) to make it work: that shows
+the container every other job directory of the account.
 
 ## Pinned versions
 
@@ -162,6 +187,7 @@ websocket URLs on an `https://` page and the browser refuses them.
 | Ultralytics | `8.4.131` | `requirements.txt` |
 | torch / torchvision | `2.13.0` / `0.28.0`, CPU-only | `Dockerfile` |
 | Model weights | `yolo11n.pt` | baked in at build time |
+| Session files (gate, supervisor) | `app-kit` (`web/`) | `Dockerfile` |
 | Apptainer | `1.5.2` | `APPTAINER_VERSION` in the workflow |
 | Actions | checkout v6, buildx v4, login v4, metadata v6, build-push v7 | the workflow |
 
@@ -175,22 +201,30 @@ block away.
 
 ## Build and test locally
 
-Skip GitHub and the registry entirely:
+Skip GitHub and the registry for the image itself (the build pulls the kit
+image, `ghcr.io/onescienceplace/app-kit`, named in the `Dockerfile`):
 
 ```bash
 docker build -t app-object-detection-jupyter:dev .   # --platform linux/amd64 on Apple Silicon
+export OSP_APP_TOKEN=$(openssl rand -hex 32)
 docker run --rm --user "$(id -u):$(id -g)" \
-  -p 8888:8888 -v "$PWD:/home/ospuser" \
-  -e OSP_APP_PORT=8888 -e OSP_APP_TOKEN=localdev app-object-detection-jupyter:dev
+  -p 127.0.0.1:8888:8888 -v "$PWD:/home/ospuser" \
+  -e OSP_APP_PORT=8888 -e OSP_APP_BIND=0.0.0.0 -e OSP_APP_TOKEN \
+  app-object-detection-jupyter:dev
 
 docker save app-object-detection-jupyter:dev -o aodj.tar
 apptainer build aodj.sif docker-archive://aodj.tar
-apptainer run --env OSP_APP_PORT=8888 --env OSP_APP_TOKEN=localdev aodj.sif
+mkdir -p tmp
+export APPTAINERENV_OSP_APP_TOKEN="$OSP_APP_TOKEN"
+apptainer run \
+  --contain --pid --ipc --cleanenv --no-mount bind-paths,cwd \
+  --pwd "$PWD" --bind "$PWD:$PWD" \
+  --env OSP_APP_PORT=8888 --env TMPDIR="$PWD/tmp" aodj.sif
 ```
 
-Open `http://localhost:8888/?token=localdev`. Locally there is no proxy in
-front, so this is plain http and the URL keeps its token — under Satellite the
-scheme is https and the entry path is otherwise identical.
+Open `http://127.0.0.1:8888/?token=<the token>`. Locally there is no proxy in
+front, so this is plain http and the URL keeps its token — through the
+Satellite proxy the scheme is https and the entry path is otherwise identical.
 
 Two things worth checking that only the `.sif` exercises: that the notebook was
 seeded into your directory rather than opened read-only out of `/app`, and that
