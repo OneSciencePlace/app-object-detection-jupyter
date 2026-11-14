@@ -1,22 +1,20 @@
-# The union of app-jupyter's and app-object-detection's manifests, pinned
-# exactly. Everything here is installed at build time: a .sif is read-only and
-# compute nodes are often offline, so nothing may be fetched on first use.
+# Python packages, installed on top of app-jupyter by /app/osp/install.sh under
+# app-jupyter's Jupyter constraints. Pinned exactly; held in step with
+# app-object-detection, so the notebook and the batch app stay comparable.
+# Everything is installed at build time: a .sif is read-only and compute nodes
+# are often offline, so nothing may be fetched on first use.
 
-# The interactive half (same pin as app-jupyter).
-jupyterlab==4.6.3
+# CPU-only torch, from PyTorch's own index. PyPI's default torch for Linux is
+# the CUDA build: ~2.5 GB more in the image, and in the .sif copied to every
+# compute node. The +cpu pins can only come from that index.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu
 
-# Widgets: the notebook's file-upload control and confidence slider. Pulls in
-# jupyterlab_widgets, which is what makes them render in JupyterLab 4 without
-# a separate `labextension install` step.
+# Widgets: the notebook's file-upload control and confidence slider.
 ipywidgets==8.1.9
 
-# The detection half (same pin as app-object-detection). Ultralytics pulls in
-# numpy, matplotlib, pillow, polars and opencv-python itself -- opencv-python
-# is a hard requirement of ultralytics, so listing opencv-python-headless here
-# as well only installs a second, shadowing copy of cv2. Hence libgl1 in the
-# Dockerfile.
-#
-# torch and torchvision are NOT listed here: the Dockerfile installs the
-# CPU-only builds from PyTorch's own index first, and this file's install then
-# finds them already satisfied.
+# The detection half (same pin as app-object-detection). It brings numpy,
+# matplotlib, pillow, polars and opencv-python, which links against libGL:
+# hence apt.txt.
 ultralytics==8.4.131

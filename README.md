@@ -13,9 +13,12 @@ run.py --image photo.jpg  ─────▶  object_detection_tutorial.ipynb
               └────── yolo11n.pt, <stem>_detected.jpg, detections.json ──────┘
 ```
 
-It is built on `app-jupyter`: JupyterLab behind the token gate, like every
-interactive app. The gate is the session's one TCP listener and checks its
-token; JupyterLab listens on a Unix socket in the session's private directory.
+It is built `FROM` the `app-jupyter` image, the way app-jupyter's README
+describes ("Build your own Jupyter image on this one"): JupyterLab behind the
+token gate, like every interactive app, with this repository adding only
+packages, two session hooks, the tutorial and the model. The gate is the
+session's one TCP listener and checks its token; JupyterLab listens on a Unix
+socket in the session's private directory.
 
 ```
 browser ──https──▶ Satellite proxy ──ssh tunnel──▶ $OSP_APP_BIND:$OSP_APP_PORT   nginx gate
@@ -28,11 +31,13 @@ browser ──https──▶ Satellite proxy ──ssh tunnel──▶ $OSP_APP_
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | The image. Weights baked at `/app/yolo11n.pt`; user `ospuser`, home `/home/ospuser`. |
-| `requirements.txt` | Pinned Python deps — `app-jupyter`'s plus `app-object-detection`'s. |
+| `Dockerfile` | `FROM app-jupyter`, pinned by tag and digest; `install.sh`, this app's build steps (weights baked at `/app/yolo11n.pt`, the tutorial at `/app/notebooks/`, user `ospuser` with home `/home/ospuser`), `finish-build.sh` last. |
+| `requirements.txt` | Pinned Python packages, `app-object-detection`'s: CPU-only torch from PyTorch's index, ipywidgets, Ultralytics. JupyterLab comes from `app-jupyter`, held at its versions. |
+| `apt.txt` | System libraries opencv needs (`libgl1`, `libglib2.0-0`). |
+| `session.d/60-ultralytics.sh` | Session hook: Ultralytics' settings directory per session. |
+| `session.d/70-tutorial.sh` | Session hook: copies the tutorial into the working directory and opens JupyterLab on it. |
 | `notebooks/object_detection_tutorial.ipynb` | The tutorial. Read-only master copy, baked in at `/app/notebooks/`. |
-| `entrypoint.sh` | The image ENTRYPOINT. Seeds the notebook, then `exec`s `jupyter lab` with `"$@"`. |
-| (`/app/web/`) | The session contract, the token gate and the supervisor. Not in this repo: the `Dockerfile` copies them from the template's kit image, `app-kit`. |
+| (from `app-jupyter`) | The entrypoint, the session files (gate, supervisor), the build tools (`/app/osp/install.sh`, `finish-build.sh`) and the Dask and Ray hooks, which do nothing here. |
 | `.github/workflows/build-and-push.yml` | Build + push both artifacts. App-agnostic — copy as-is. |
 
 ## Run it
@@ -82,8 +87,8 @@ one from inside the notebook) and run the cells.
 | `OSP_APP_TOKEN` | generated | per-session secret, checked by the gate |
 | `OSP_APP_TOKEN_NAME` | `token` | the query parameter (and cookie) it arrives in |
 | `APP_MODEL` | `/app/yolo11n.pt` | the baked-in weights; same variable `run.py` reads |
-| `OSP_NOTEBOOK` | `object_detection_tutorial.ipynb` | the notebook JupyterLab opens on |
-| `OSP_SEED_NOTEBOOKS` | `1` | set `0` to skip seeding entirely |
+| `OSP_NOTEBOOK` | `object_detection_tutorial.ipynb` | the notebook JupyterLab opens on (`session.d/70-tutorial.sh`) |
+| `OSP_SEED_NOTEBOOKS` | `1` | set `0` to copy no notebooks (`session.d/70-tutorial.sh`) |
 
 ## `ospuser`, and where the notebook lives
 
@@ -102,7 +107,7 @@ the point: a path that works in the notebook works in the batch app.
 
 `/home/ospuser` is mode `1777`, not `0755`, because the runtime uid is whatever
 the caller happens to be (`docker run --user`, or any user at all under
-Apptainer) and the entrypoint has to be able to write into it.
+Apptainer) and the tutorial hook has to be able to copy the notebook into it.
 
 ### Why the notebook is copied instead of just opened
 
@@ -113,8 +118,11 @@ model weights. It cannot be the file you open:
   Ctrl-S would fail.
 - A bind mount over the home directory would hide anything baked there anyway.
 
-So `entrypoint.sh` copies it into the working directory at startup. It **never
-overwrites an existing file** — restart the container and your edits survive.
+So the session hook `session.d/70-tutorial.sh` copies it into the working
+directory at every session start, before JupyterLab starts, and points
+JupyterLab at it (`LabApp.default_url`, in a config file in the session's
+private config directory). It **never overwrites an existing file** — start a
+new session and your edits survive.
 If the working directory is not writable it says so on stderr and leaves the
 read-only master where you can still open it.
 
@@ -147,7 +155,8 @@ that reruns `model.predict` at a new threshold, so you see the effect of
 
 ## Kernels, the session directory and scratch paths
 
-Inherited unchanged from `app-jupyter`, whose README has the reasoning:
+Inherited unchanged from `app-jupyter` (the image this one is built on), whose
+README has the reasoning:
 
 - JupyterLab sits behind the gate on a Unix socket, with its own token off and
   without `OSP_APP_TOKEN` in its environment: only the gate holds the
@@ -169,7 +178,17 @@ Inherited unchanged from `app-jupyter`, whose README has the reasoning:
 The library caches (`XDG_CACHE_HOME`, `YOLO_CONFIG_DIR`, `MPLCONFIGDIR`)
 default to `/tmp` in the image, for the same read-only-filesystem reason as the
 batch app; at run time each moves to a per-session directory under `$TMPDIR`
-(`<job directory>/tmp` under the run profile), unless the job set its own.
+(`<job directory>/tmp` under the run profile), unless the job set its own:
+`app-jupyter` moves the first and last, and this image's hook
+`session.d/60-ultralytics.sh` moves `YOLO_CONFIG_DIR`.
+
+**Built by `app-jupyter`'s tools.** `install.sh` installed `apt.txt` and
+`requirements.txt` with JupyterLab, Jupyter Server and the kernel held at
+`app-jupyter`'s versions, and added the two hooks; `finish-build.sh`, the last
+`RUN` line, removed `debugpy`, checked the image and stripped setuid and setgid
+bits. Nothing in this image starts a server from a notebook unless the user's
+code does (`torch.distributed`, for instance): the residual risk app-jupyter's
+`osp/session.d/README.md` describes.
 
 **Scratch paths.** The entrypoint does not trust an inherited `$TMPDIR`. A
 scheduler's `/scratch/$USER/job.N` is a host path Apptainer may not bind, so it
@@ -181,28 +200,30 @@ the container every other job directory of the account.
 
 | What | Version | Where |
 |---|---|---|
-| Base image | `python:3.14-slim` | `Dockerfile` |
-| JupyterLab | `4.6.3` | `requirements.txt` |
+| Base image | `app-jupyter:4.6.3-osp2` (Python 3.14, JupyterLab 4.6.3, the kit's session files) | `Dockerfile` |
 | ipywidgets | `8.1.9` | `requirements.txt` |
 | Ultralytics | `8.4.131` | `requirements.txt` |
-| torch / torchvision | `2.13.0` / `0.28.0`, CPU-only | `Dockerfile` |
+| torch / torchvision | `2.13.0+cpu` / `0.28.0+cpu`, CPU-only | `requirements.txt` |
 | Model weights | `yolo11n.pt` | baked in at build time |
-| Session files (gate, supervisor) | `app-kit` (`web/`) | `Dockerfile` |
 | Apptainer | `1.5.2` | `APPTAINER_VERSION` in the workflow |
 | Actions | checkout v6, buildx v4, login v4, metadata v6, build-push v7 | the workflow |
 
-The Python pins are held in step with `app-object-detection` and `app-jupyter`
-on purpose. Bump them together, or the two halves stop being comparable.
+The Python pins are held in step with `app-object-detection` on purpose. Bump
+them together, or the two halves stop being comparable. JupyterLab moves only
+when the `FROM` line moves to a newer `app-jupyter`.
 
 The image is CPU-only: PyPI's default torch wheel is the CUDA build, which adds
-roughly 2 GB the `.sif` then carries to every compute node. The Dockerfile
-installs torch from PyTorch's CPU index first; the GPU route is one commented
-block away.
+roughly 2 GB the `.sif` then carries to every compute node. `requirements.txt`
+takes torch from PyTorch's CPU index (`--extra-index-url`, and the `+cpu`
+versions only that index has). For a GPU image, drop those three lines for the
+plain `torch` / `torchvision` pins; the base would then also need CUDA's
+runtime, which `app-jupyter` does not have.
 
 ## Build and test locally
 
-Skip GitHub and the registry for the image itself (the build pulls the kit
-image, `ghcr.io/onescienceplace/app-kit`, named in the `Dockerfile`):
+Skip GitHub and the registry for the image itself (the build pulls its base,
+`ghcr.io/onescienceplace/app-jupyter`, named in the `Dockerfile`; on Apple
+Silicon a session cannot start under emulation, see app-jupyter's README):
 
 ```bash
 docker build -t app-object-detection-jupyter:dev .   # --platform linux/amd64 on Apple Silicon
