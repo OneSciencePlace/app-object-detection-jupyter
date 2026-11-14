@@ -1,0 +1,2 @@
+# opencv-python (a dependency of ultralytics) links against libGL and GLib.
+libgl1 libglib2.0-0
